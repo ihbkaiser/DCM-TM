@@ -1,0 +1,23 @@
+# Data files (too large for git)
+data/
+data/**
+outputs/
+outputs/**
+
+# Archive
+archive.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

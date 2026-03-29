@@ -1,0 +1,74 @@
+# ─── Continual Topic Model Configuration ────────────────────────────────────
+
+data:
+  dir: "data/NIPS"
+  train_bow: "train_bow.npz"
+  test_bow: "test_bow.npz"
+  vocab: "vocab.txt"
+  train_times: "train_times.txt"
+  test_times: "test_times.txt"
+  time2id: "time2id.txt"
+
+vae:
+  # Number of local topics per timestamp
+  n_topics: 50
+  # Hidden dimensions for encoder
+  enc_hidden: 256
+  # Latent dimension (= n_topics for ProdLDA)
+  # Dropout on encoder input (BoW)
+  dropout: 0.2
+  # Training
+  lr: 0.002
+  weight_decay: 1.0e-6
+  batch_size: 256
+  epochs: 100
+  patience: 10          # early stopping patience
+  kl_warmup_epochs: 20  # linearly anneal KL weight from 0 → 1
+  # Residual delta learning
+  use_residual: true    # L_t = G_{t-1} + ΔL_t
+
+topics:
+  # Number of top words to represent each topic
+  top_m_words: 15
+  # Embedding model for topic representations
+  embedding_model: "all-MiniLM-L6-v2"
+  # Number of nearest topics to consider in LLM curation
+  top_k_nearest: 5
+  # Cosine similarity threshold for "close" topics
+  similarity_threshold: 0.7
+
+llm:
+  # Provider: "gemini" or "none" (skip LLM, use similarity-based fallback)
+  provider: "none"
+  # Model name (for Gemini)
+  model: "gemini-2.0-flash"
+  # Temperature for LLM calls
+  temperature: 0.1
+  # Max tokens per response
+  max_tokens: 1024
+  # Rate limiting (seconds between calls)
+  rate_limit_delay: 0.5
+  # Retry on failure
+  max_retries: 3
+
+  # Fallback thresholds (used when provider = "none")
+  fallback:
+    # If max cosine sim between global topic and any local topic < this → REMOVE
+    prune_threshold: 0.3
+    # If max cosine sim between local topic and any global topic < this → NOVEL
+    novel_threshold: 0.5
+
+pipeline:
+  # Output directory for results
+  output_dir: "outputs"
+  # Initial number of global topics (from T0)
+  init_global_from_first: true
+  # Save intermediate results per timestamp
+  save_intermediate: true
+  # Random seed
+  seed: 42
+  # Device: "auto", "cpu", "cuda"
+  device: "auto"
+
+logging:
+  level: "INFO"
