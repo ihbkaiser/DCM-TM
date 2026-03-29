@@ -14,11 +14,43 @@ Supports:
 
 import json
 import time
+import logging
 import numpy as np
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from src.topic_utils import Topic, cosine_similarity_matrix, find_nearest_topics
+
+# ─── Prompt logger (writes to outputs/prompts.log) ───────────────────────────
+
+_prompt_logger: Optional[logging.Logger] = None
+
+def _get_prompt_logger(log_path: str = "outputs/prompts.log") -> logging.Logger:
+    global _prompt_logger
+    if _prompt_logger is None:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("prompt_logger")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(fh)
+        _prompt_logger = logger
+    return _prompt_logger
+
+
+def _log_prompt(stage: str, topic_id: int, prompt: str,
+                response: str, log_path: str = "outputs/prompts.log"):
+    logger = _get_prompt_logger(log_path)
+    sep = "═" * 80
+    logger.debug(
+        f"\n{sep}\n"
+        f"[{stage}] topic_id={topic_id}  ts={time.strftime('%H:%M:%S')}\n"
+        f"{'─'*40} PROMPT {'─'*40}\n{prompt}\n"
+        f"{'─'*40} RESPONSE {'─'*38}\n{response}\n"
+        f"{sep}"
+    )
 
 
 @dataclass
@@ -36,7 +68,7 @@ class CurationDecision:
 class LLMCurator:
     """LLM-based topic curator."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, log_path: str = "outputs/prompts.log"):
         self.provider = config.get("provider", "none")
         self.model_name = config.get("model", "gemini-2.0-flash")
         self.temperature = config.get("temperature", 0.1)
@@ -44,6 +76,7 @@ class LLMCurator:
         self.rate_limit_delay = config.get("rate_limit_delay", 0.5)
         self.max_retries = config.get("max_retries", 3)
         self.fallback_config = config.get("fallback", {})
+        self.log_path = log_path
 
         self._client = None
         if self.provider == "gemini":
@@ -52,15 +85,20 @@ class LLMCurator:
     def _init_gemini(self):
         """Initialize Google Generative AI client."""
         try:
+            import os
             from google import genai
-            self._client = genai.Client()
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if api_key:
+                self._client = genai.Client(api_key=api_key)
+            else:
+                self._client = genai.Client()  # falls back to ADC / GOOGLE_APPLICATION_CREDENTIALS
             print(f"  LLM Curator: Using Gemini ({self.model_name})")
         except Exception as e:
             print(f"  Warning: Failed to init Gemini: {e}. Falling back to similarity-based.")
             self.provider = "none"
 
-    def _call_llm(self, prompt: str) -> str:
-        """Call the LLM and return text response."""
+    def _call_llm(self, prompt: str, stage: str = "", topic_id: int = -1) -> str:
+        """Call the LLM and return text response. Logs prompt and response."""
         if self.provider == "gemini":
             from google import genai
             for attempt in range(self.max_retries):
@@ -73,12 +111,17 @@ class LLMCurator:
                             "max_output_tokens": self.max_tokens,
                         },
                     )
+                    text = response.text
+                    _log_prompt(stage, topic_id, prompt, text, self.log_path)
                     time.sleep(self.rate_limit_delay)
-                    return response.text
+                    return text
                 except Exception as e:
                     print(f"    LLM call failed (attempt {attempt+1}): {e}")
                     time.sleep(2 ** attempt)
+            _log_prompt(stage, topic_id, prompt, "[FAILED]", self.log_path)
             return ""
+        # provider == "none": log the prompt with a fallback marker
+        _log_prompt(stage, topic_id, prompt, "[SKIPPED — fallback mode]", self.log_path)
         return ""
 
     # ─── Stage 1: Prune & Refine ─────────────────────────────────────────────
@@ -109,32 +152,37 @@ class LLMCurator:
             neighbor_strs = []
             for l_idx, sim in neighbors:
                 neighbor_strs.append(
-                    f"  - Local topic (sim={sim:.3f}): {local_topics[l_idx].to_string()}"
+                    f"  - {local_topics[l_idx].to_string()}"
                 )
 
             prompt = self._build_stage1_prompt(g_topic, neighbor_strs)
-            response = self._call_llm(prompt)
+            response = self._call_llm(prompt, stage="Stage1-Prune", topic_id=g_topic.id)
             decision = self._parse_stage1_response(response, g_topic.id)
             decisions.append(decision)
 
         return decisions
 
     def _build_stage1_prompt(self, global_topic: Topic, neighbor_strs: list[str]) -> str:
-        return f"""You are a topic modeling expert. Evaluate whether a GLOBAL topic should be RETAINED or REMOVED based on evidence from local (current) topics.
+        return f"""You are a topic modeling expert analyzing research topic evolution.
 
-GLOBAL TOPIC: {global_topic.to_string()}
+GLOBAL TOPIC (from previous time period):
+  {global_topic.to_string()}
 
-NEAREST LOCAL TOPICS (by embedding similarity):
+TOP-K MOST SIMILAR LOCAL TOPICS (from current data):
 {chr(10).join(neighbor_strs)}
 
-INSTRUCTIONS:
-- RETAIN: The global topic still represents a meaningful, active research theme evidenced by local topics.
-- REMOVE: The global topic is outdated, redundant, or no longer supported by current data.
+TASK: Decide whether this global topic should be RETAINED or REMOVED.
 
-If RETAIN, optionally refine the topic's top words to better reflect current usage.
+DECISION CRITERIA:
+- REMOVE if none of the local topics are semantically related to this global topic,
+  meaning the theme has become outdated, irrelevant, or absorbed into other topics.
+- RETAIN if at least one local topic shares a clearly related research theme,
+  meaning the topic is still active in the current data.
 
-Respond in JSON format:
-{{"action": "RETAIN" or "REMOVE", "refined_words": ["word1", "word2", ...] or null, "reason": "brief explanation"}}
+If RETAIN, optionally refine the topic's representative words based on current local usage.
+
+Respond ONLY with a JSON object:
+{{"action": "RETAIN" or "REMOVE", "refined_words": ["word1", "word2", ...] or null, "reason": "brief explanation of decision"}}
 """
 
     def _parse_stage1_response(self, response: str, topic_id: int) -> CurationDecision:
@@ -160,14 +208,17 @@ Respond in JSON format:
         global_topics: list[Topic],
         local_topics: list[Topic],
     ) -> list[CurationDecision]:
-        """Similarity-based fallback for Stage 1."""
+        """Similarity-based fallback for Stage 1.
+
+        REMOVE if even the most similar local topic has cosine sim < threshold.
+        """
         threshold = self.fallback_config.get("prune_threshold", 0.3)
 
         if not local_topics:
             # No local topics → remove all globals
             return [
                 CurationDecision(topic_id=g.id, action="REMOVE",
-                                 reason=f"No local topics to support")
+                                 reason="No local topics to support")
                 for g in global_topics
             ]
 
@@ -180,7 +231,6 @@ Respond in JSON format:
                 # Find the closest local topic to potentially refine
                 best_local_idx = int(sim_matrix[g_idx].argmax())
                 best_local = local_topics[best_local_idx]
-                # Merge words: keep global words that appear in local, add new local words
                 refined = _merge_topic_words(g_topic, best_local)
                 decisions.append(CurationDecision(
                     topic_id=g_topic.id,
@@ -193,7 +243,7 @@ Respond in JSON format:
                 decisions.append(CurationDecision(
                     topic_id=g_topic.id,
                     action="REMOVE",
-                    reason=f"max_sim={max_sim:.3f} < {threshold}",
+                    reason=f"max_sim={max_sim:.3f} < {threshold} (not similar to any local topic)",
                     confidence=1.0 - max_sim,
                 ))
 
@@ -237,31 +287,36 @@ Respond in JSON format:
             neighbor_strs = []
             for g_idx, sim in neighbors:
                 neighbor_strs.append(
-                    f"  - Global topic (sim={sim:.3f}): {retained_global_topics[g_idx].to_string()}"
+                    f"  - {retained_global_topics[g_idx].to_string()}"
                 )
 
             prompt = self._build_stage2_prompt(l_topic, neighbor_strs)
-            response = self._call_llm(prompt)
+            response = self._call_llm(prompt, stage="Stage2-Novel", topic_id=l_topic.id)
             decision = self._parse_stage2_response(response, l_topic.id, l_topic.words)
             decisions.append(decision)
 
         return decisions
 
     def _build_stage2_prompt(self, local_topic: Topic, neighbor_strs: list[str]) -> str:
-        return f"""You are a topic modeling expert. Determine whether a LOCAL topic represents a NOVEL research theme or is already COVERED by existing global topics.
+        return f"""You are a topic modeling expert analyzing research topic evolution.
 
-LOCAL TOPIC: {local_topic.to_string()}
+LOCAL TOPIC (from current data):
+  {local_topic.to_string()}
 
-NEAREST GLOBAL TOPICS (by embedding similarity):
+TOP-K MOST SIMILAR GLOBAL TOPICS (existing topics):
 {chr(10).join(neighbor_strs)}
 
-INSTRUCTIONS:
-- NOVEL: The local topic represents a genuinely new or emerging theme not adequately covered by any global topic.
-- COVERED: The local topic is essentially the same as or a subset of an existing global topic.
+TASK: Decide whether this local topic is NOVEL or already COVERED by existing global topics.
+
+DECISION CRITERIA:
+- COVERED if at least one global topic shares a clearly related research theme,
+  meaning this topic is already represented in the global memory.
+- NOVEL if none of the global topics are semantically related, meaning this is a
+  genuinely new or emerging research theme not yet in the global memory.
 
 If NOVEL, provide refined representative words for the new topic.
 
-Respond in JSON format:
+Respond ONLY with a JSON object:
 {{"action": "NOVEL" or "COVERED", "refined_words": ["word1", "word2", ...] or null, "reason": "brief explanation"}}
 """
 
@@ -328,7 +383,7 @@ Respond in JSON format:
         return decisions
 
 
-# ─── Helper ──────────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _merge_topic_words(topic_a: Topic, topic_b: Topic, max_words: int = 15) -> list[str]:
     """Merge words from two topics, preferring topic_a's order."""

@@ -39,7 +39,7 @@ topics:
 
 llm:
   # Provider: "gemini" or "none" (skip LLM, use similarity-based fallback)
-  provider: "none"
+  provider: "gemini"
   # Model name (for Gemini)
   model: "gemini-2.0-flash"
   # Temperature for LLM calls
@@ -63,6 +63,8 @@ pipeline:
   output_dir: "outputs"
   # Initial number of global topics (from T0)
   init_global_from_first: true
+  # Max total topic slots in global memory (caps growth)
+  max_topics: 200
   # Save intermediate results per timestamp
   save_intermediate: true
   # Random seed

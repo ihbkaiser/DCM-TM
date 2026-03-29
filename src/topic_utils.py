@@ -27,14 +27,6 @@ class Topic:
         """Human-readable topic string."""
         return ", ".join(self.words)
 
-    def to_weighted_string(self) -> str:
-        """Weighted topic string for embedding."""
-        # Repeat top words more for emphasis
-        parts = []
-        for w, wt in zip(self.words, self.word_weights):
-            parts.append(w)
-        return " ".join(parts)
-
 
 # ─── Topic Extraction ────────────────────────────────────────────────────────
 

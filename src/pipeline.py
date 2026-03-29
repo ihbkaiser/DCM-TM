@@ -78,11 +78,16 @@ class ContinualTopicPipeline:
             self.device = device_str
         print(f"Using device: {self.device}")
 
-        # LLM Curator
-        self.curator = LLMCurator(config.get("llm", {}))
+        # LLM Curator (log prompts to outputs/prompts.log)
+        log_path = str(self.output_dir / "prompts.log")
+        self.curator = LLMCurator(config.get("llm", {}), log_path=log_path)
 
         # Global memory
-        self.global_memory = GlobalMemory(embedding_model=self.embedding_model)
+        max_topics = pipe_cfg.get("max_topics", 200)
+        self.global_memory = GlobalMemory(
+            embedding_model=self.embedding_model,
+            max_topics=max_topics,
+        )
 
         # Results tracking
         self.results = []
@@ -135,7 +140,16 @@ class ContinualTopicPipeline:
 
         # ── Step 1: Local VAE Training ───────────────────────────────────────
         print(f"\n  Step 1: Training local VAE...")
-        local_topics, local_beta, train_info = self._step1_train_vae(ts)
+        # Dynamic K: at t > 0, train with n_topics = K_{t-1} so that
+        # L_t ∈ R^{K_{t-1} × V} matches G_{t-1} for residual learning.
+        if is_first:
+            n_topics_this = self.n_topics   # K_0 — use configured default
+        else:
+            n_topics_this = self.global_memory.n_topics  # K_{t-1}
+        print(f"  n_topics = {n_topics_this} (K_{{t-1}} = {self.global_memory.K})")
+        local_topics, local_beta, train_info = self._step1_train_vae(
+            ts, n_topics_override=n_topics_this
+        )
         result["train_info"] = {
             "final_epoch": train_info["final_epoch"],
             "best_loss": float(train_info["best_loss"]),
@@ -158,9 +172,11 @@ class ContinualTopicPipeline:
             return result
 
         # ── Step 2: LLM Stage 1 — Prune & Refine ────────────────────────────
-        print(f"\n  Step 2: Prune & Refine ({self.global_memory.n_topics} global topics)...")
+        active_global = self.global_memory.active_topics
+        print(f"\n  Step 2: Prune & Refine ({self.global_memory.n_topics} active / "
+              f"{self.global_memory.K} slots)...")
         stage1_decisions = self.curator.stage1_prune_and_refine(
-            global_topics=self.global_memory.topics,
+            global_topics=active_global,
             local_topics=local_topics,
             top_k=self.top_k_nearest,
         )
@@ -170,7 +186,7 @@ class ContinualTopicPipeline:
         removed_count = 0
         for i, dec in enumerate(stage1_decisions):
             if dec.action == "RETAIN":
-                retained_indices.append(i)
+                retained_indices.append(i)   # index into active_global list
                 if dec.refined_words:
                     retained_refined[i] = dec.refined_words
             else:
@@ -179,7 +195,7 @@ class ContinualTopicPipeline:
         print(f"  Stage 1 result: {len(retained_indices)} retained, {removed_count} removed")
 
         # Build retained global topics list for Stage 2
-        retained_global = [self.global_memory.topics[i] for i in retained_indices]
+        retained_global = [active_global[i] for i in retained_indices]
 
         # ── Step 3: LLM Stage 2 — Detect Novel ──────────────────────────────
         print(f"\n  Step 3: Detect Novel ({len(local_topics)} local topics)...")
@@ -206,7 +222,7 @@ class ContinualTopicPipeline:
         novel_beta_arr = np.stack(novel_beta_rows) if novel_beta_rows else None
         print(f"  Stage 2 result: {len(novel_topics)} novel, {covered_count} covered")
 
-        # ── Step 4: Update Global State ──────────────────────────────────────
+        # ── Step 4: Update Global State ──────────────────────────────────
         print(f"\n  Step 4: Updating global state...")
         self.global_memory.update(
             retained_indices=retained_indices,
@@ -221,12 +237,20 @@ class ContinualTopicPipeline:
         result["n_removed"] = removed_count
         result["n_novel"] = len(novel_topics)
         result["n_global"] = self.global_memory.n_topics
-        result["global_diversity"] = topic_diversity(self.global_memory.topics)
+        result["global_diversity"] = topic_diversity(self.global_memory.active_topics)
 
         return result
 
-    def _step1_train_vae(self, ts: int):
-        """Train VAE on a single timestamp's data and extract local topics."""
+    def _step1_train_vae(self, ts: int, n_topics_override: Optional[int] = None):
+        """Train VAE on a single timestamp's data and extract local topics.
+
+        n_topics_override: if given, use this instead of self.n_topics.
+        At t > 0, this is set to global_memory.n_topics = K_{t-1} so that
+        the local model L_t has the same shape as G_{t-1} and residual
+        learning L_t = G_{t-1} + ΔL_t is always applicable.
+        """
+        n_topics = n_topics_override if n_topics_override is not None else self.n_topics
+
         ts_data = self.corpus.train_data[ts]
         train_loader = make_dataloader(ts_data, batch_size=self.batch_size, shuffle=True)
 
@@ -239,25 +263,22 @@ class ContinualTopicPipeline:
                 shuffle=False,
             )
 
-        # Create model
+        # Create model with dynamic n_topics = K_{t-1}
         model = ProdLDA(
             vocab_size=self.corpus.vocab_size,
-            n_topics=self.n_topics,
+            n_topics=n_topics,
             enc_hidden=self.enc_hidden,
             dropout=self.dropout,
         )
 
-        # Global beta for residual learning
+        # Global beta for residual learning — always (K_{t-1}, V) in dynamic design
         global_beta = None
-        if self.use_residual and self.global_memory.n_topics > 0:
+        if self.use_residual and self.global_memory.K > 0:
             gb = self.global_memory.get_beta_tensor(self.device)
-            if gb is not None and gb.shape[0] == self.n_topics:
+            if gb is not None:
+                # gb.shape[0] == n_topics always (both equal K_{t-1})
                 global_beta = gb
-                print(f"  Using residual learning with {gb.shape[0]} global topic logits")
-            else:
-                if gb is not None:
-                    print(f"  Skipping residual: global has {gb.shape[0]} topics, "
-                          f"local expects {self.n_topics}")
+                print(f"  Using residual learning: K_{{t-1}} = {gb.shape[0]} topics")
 
         # Train
         train_info = train_vae(
@@ -299,7 +320,7 @@ class ContinualTopicPipeline:
         print(f"    Retained: {result['n_retained']}, "
               f"Removed: {result['n_removed']}, "
               f"Novel: {result['n_novel']}")
-        print(f"    Global topics: {result['n_global']}")
+        print(f"    Global K = {result['n_global']} active topics")
         if "global_diversity" in result:
             print(f"    Global diversity: {result['global_diversity']:.3f}")
         if "wall_time" in result:
@@ -309,12 +330,12 @@ class ContinualTopicPipeline:
         print(f"\n{'='*70}")
         print("PIPELINE COMPLETE")
         print(f"{'='*70}")
-        print(f"Final global topics: {self.global_memory.n_topics}")
+        print(f"Final global topics: K = {self.global_memory.n_topics}")
         print(f"\nTopic evolution:")
         for r in self.results:
             print(f"  T{r['timestamp']:2d} ({r['label']:>9s}): "
                   f"+{r['n_novel']:3d} novel, -{r['n_removed']:3d} removed, "
-                  f"={r['n_retained']:3d} retained → {r['n_global']:3d} global")
+                  f"={r['n_retained']:3d} retained → K_{r['timestamp']} = {r['n_global']}")
 
         print(f"\n{self.global_memory.get_summary()}")
 
