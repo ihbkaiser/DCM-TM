@@ -21,6 +21,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import Optional
 from dataclasses import dataclass
 
+from src.topic_utils import get_word_embedding_matrix
+
 
 @dataclass
 class VAEOutput:
@@ -61,14 +63,36 @@ class ProdLDADecoder(nn.Module):
     Uses BatchNorm on the pre-softmax logits for stability.
     """
 
-    def __init__(self, vocab_size: int, n_topics: int):
+    def __init__(
+        self,
+        vocab_size: int,
+        n_topics: int,
+        word_embeddings: Optional[np.ndarray] = None,
+    ):
         super().__init__()
-        # Topic-word logits (local delta when doing residual learning)
-        self.topic_word_logits = nn.Linear(n_topics, vocab_size, bias=False)
+        self.factorized = word_embeddings is not None
+        if self.factorized:
+            word_embeddings = word_embeddings.astype(np.float32)
+            emb_dim = word_embeddings.shape[1]
+            self.topic_embeddings = nn.Parameter(torch.randn(n_topics, emb_dim) * 0.02)
+            self.register_buffer(
+                "word_embeddings",
+                torch.tensor(word_embeddings, dtype=torch.float32),
+            )
+            self.topic_word_logits = None
+        else:
+            # Topic-word logits (local delta when doing residual learning)
+            self.topic_word_logits = nn.Linear(n_topics, vocab_size, bias=False)
         # BN on pre-softmax logits (critical for ProdLDA stability)
         self.bn = nn.BatchNorm1d(vocab_size, affine=True)
         # Small dropout on decoder
         self.drop = nn.Dropout(0.1)
+
+    def get_local_logits(self) -> torch.Tensor:
+        """Return topic-word logits with shape (n_topics, vocab_size)."""
+        if self.factorized:
+            return torch.mm(self.topic_embeddings, self.word_embeddings.T)
+        return self.topic_word_logits.weight.T
 
     def forward(self, theta: torch.Tensor, global_beta: Optional[torch.Tensor] = None):
         """
@@ -79,7 +103,7 @@ class ProdLDADecoder(nn.Module):
             log_recon: (batch, vocab_size) log-probability of words
         """
         # Get local topic-word logits
-        local_logits = self.topic_word_logits.weight.T  # (n_topics, vocab_size)
+        local_logits = self.get_local_logits()
 
         if global_beta is not None:
             combined = global_beta + local_logits
@@ -104,13 +128,21 @@ class ProdLDA(nn.Module):
     """
 
     def __init__(self, vocab_size: int, n_topics: int, enc_hidden: int = 256,
-                 dropout: float = 0.2):
+                 dropout: float = 0.2, vocab: Optional[list[str]] = None,
+                 embedding_model: str = "all-MiniLM-L6-v2",
+                 factorized_decoder: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_topics = n_topics
+        self.factorized_decoder = factorized_decoder
 
         self.encoder = ProdLDAEncoder(vocab_size, n_topics, enc_hidden, dropout)
-        self.decoder = ProdLDADecoder(vocab_size, n_topics)
+        word_embeddings = None
+        if factorized_decoder:
+            if vocab is None:
+                raise ValueError("vocab is required when factorized_decoder=True")
+            word_embeddings = get_word_embedding_matrix(vocab, embedding_model)
+        self.decoder = ProdLDADecoder(vocab_size, n_topics, word_embeddings)
 
         # Prior parameters (standard normal)
         self.prior_mu = nn.Parameter(torch.zeros(n_topics), requires_grad=False)
@@ -170,7 +202,7 @@ class ProdLDA(nn.Module):
         Returns softmax-normalized distributions over words for each topic.
         """
         with torch.no_grad():
-            local_logits = self.decoder.topic_word_logits.weight.T
+            local_logits = self.decoder.get_local_logits()
             if global_beta is not None:
                 combined = global_beta + local_logits
             else:
@@ -184,12 +216,21 @@ class ProdLDA(nn.Module):
         These are the unnormalized logits (useful for residual learning).
         """
         with torch.no_grad():
-            local_logits = self.decoder.topic_word_logits.weight.T
+            local_logits = self.decoder.get_local_logits()
             if global_beta is not None:
                 combined = global_beta + local_logits
             else:
                 combined = local_logits
         return combined.cpu().numpy()
+
+    def get_topic_embeddings(self) -> Optional[np.ndarray]:
+        """Return learned topic embeddings alpha when using factorized decoder."""
+        if not self.decoder.factorized:
+            return None
+        with torch.no_grad():
+            alpha = self.decoder.topic_embeddings
+            alpha = alpha / (alpha.norm(dim=1, keepdim=True) + 1e-12)
+        return alpha.cpu().numpy()
 
 
 # ─── Training ────────────────────────────────────────────────────────────────
@@ -306,4 +347,82 @@ def train_vae(
         "history": history,
         "best_loss": best_loss,
         "final_epoch": epoch,
+    }
+
+
+def infer_theta_fixed_beta(
+    train_loader,
+    beta: np.ndarray,
+    vocab_size: int,
+    n_topics: int,
+    enc_hidden: int = 256,
+    dropout: float = 0.2,
+    epochs: int = 50,
+    lr: float = 0.002,
+    weight_decay: float = 1e-6,
+    kl_warmup_epochs: int = 10,
+    device: str = "cpu",
+) -> tuple[np.ndarray, dict]:
+    """Infer aligned document-topic proportions with fixed global topics.
+
+    beta is a (K, V) topic-word distribution from the updated global memory.
+    Only the encoder is trained; the topic-word matrix is fixed.
+    """
+    encoder = ProdLDAEncoder(vocab_size, n_topics, enc_hidden, dropout).to(device)
+    beta_tensor = torch.tensor(beta, dtype=torch.float32, device=device)
+    beta_tensor = beta_tensor / (beta_tensor.sum(dim=1, keepdim=True) + 1e-12)
+
+    optimizer = Adam(encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    history = {"loss": [], "recon": [], "kl": [], "kl_weight": []}
+
+    for epoch in range(1, epochs + 1):
+        kl_weight = min(1.0, epoch / kl_warmup_epochs) if kl_warmup_epochs > 0 else 1.0
+        encoder.train()
+        total_loss = total_recon = total_kl = 0.0
+        n_batches = 0
+
+        for batch in train_loader:
+            batch = batch.to(device)
+            x_norm = batch / (batch.sum(dim=1, keepdim=True) + 1e-12)
+            mu, log_var = encoder(x_norm)
+            std = torch.exp(0.5 * log_var)
+            theta = F.softmax(mu + torch.randn_like(std) * std, dim=-1)
+
+            word_probs = torch.mm(theta, beta_tensor).clamp_min(1e-12)
+            recon_loss = -(batch * word_probs.log()).sum(dim=1).mean()
+            kl = 0.5 * (
+                torch.exp(log_var) + mu.pow(2) - 1.0 - log_var
+            ).sum(dim=1).mean()
+            loss = recon_loss + kl_weight * kl
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=5.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_recon += recon_loss.item()
+            total_kl += kl.item()
+            n_batches += 1
+
+        history["loss"].append(total_loss / n_batches)
+        history["recon"].append(total_recon / n_batches)
+        history["kl"].append(total_kl / n_batches)
+        history["kl_weight"].append(kl_weight)
+
+    encoder.eval()
+    theta_batches = []
+    with torch.no_grad():
+        for batch in train_loader:
+            batch = batch.to(device)
+            x_norm = batch / (batch.sum(dim=1, keepdim=True) + 1e-12)
+            mu, _ = encoder(x_norm)
+            theta = F.softmax(mu, dim=-1)
+            theta_batches.append(theta.cpu().numpy())
+
+    theta_all = np.vstack(theta_batches) if theta_batches else np.zeros((0, n_topics))
+    return theta_all, {
+        "history": history,
+        "final_loss": history["loss"][-1] if history["loss"] else None,
+        "epochs": epochs,
     }

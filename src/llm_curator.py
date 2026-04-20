@@ -63,6 +63,22 @@ class CurationDecision:
     confidence: float = 0.0
 
 
+@dataclass
+class RetainPrior:
+    """Soft retain prior for a global topic."""
+    topic_id: int
+    probability: float
+    reason: str = ""
+
+
+@dataclass
+class NoveltyPrior:
+    """Soft novelty prior for a local topic."""
+    topic_id: int
+    probability: float
+    reason: str = ""
+
+
 # ─── LLM Interface ───────────────────────────────────────────────────────────
 
 class LLMCurator:
@@ -125,6 +141,194 @@ class LLMCurator:
         return ""
 
     # ─── Stage 1: Prune & Refine ─────────────────────────────────────────────
+
+    # --- Soft priors: Retain / Novelty probabilities ------------------------
+
+    def score_retain_priors(
+        self,
+        global_topics: list[Topic],
+        local_topics: list[Topic],
+        top_k: int = 5,
+    ) -> list[RetainPrior]:
+        """Return soft survival priors p_k^LLM for global topics."""
+        if not global_topics:
+            return []
+
+        if self.provider == "none":
+            return self._retain_prior_fallback(global_topics, local_topics)
+
+        nearest = find_nearest_topics(global_topics, local_topics, top_k=top_k)
+        priors = []
+        for g_idx, g_topic in enumerate(global_topics):
+            neighbor_strs = [
+                f"  - {local_topics[l_idx].to_string()} (similarity={sim:.3f})"
+                for l_idx, sim in nearest[g_idx]
+            ]
+            prompt = self._build_retain_prior_prompt(g_topic, neighbor_strs)
+            response = self._call_llm(prompt, stage="Soft-Retain", topic_id=g_topic.id)
+            priors.append(self._parse_retain_prior_response(response, g_topic.id))
+        return priors
+
+    def score_novelty_priors(
+        self,
+        local_topics: list[Topic],
+        global_topics: list[Topic],
+        top_k: int = 5,
+    ) -> list[NoveltyPrior]:
+        """Return soft novelty priors q_j^LLM for local topics."""
+        if not local_topics:
+            return []
+
+        if self.provider == "none":
+            return self._novelty_prior_fallback(local_topics, global_topics)
+
+        if not global_topics:
+            return [
+                NoveltyPrior(topic_id=l.id, probability=1.0,
+                             reason="No global topics to compare against")
+                for l in local_topics
+            ]
+
+        nearest = find_nearest_topics(local_topics, global_topics, top_k=top_k)
+        priors = []
+        for l_idx, l_topic in enumerate(local_topics):
+            neighbor_strs = [
+                f"  - {global_topics[g_idx].to_string()} (similarity={sim:.3f})"
+                for g_idx, sim in nearest[l_idx]
+            ]
+            prompt = self._build_novelty_prior_prompt(l_topic, neighbor_strs)
+            response = self._call_llm(prompt, stage="Soft-Novelty", topic_id=l_topic.id)
+            priors.append(self._parse_novelty_prior_response(response, l_topic.id))
+        return priors
+
+    def _build_retain_prior_prompt(self, global_topic: Topic,
+                                   neighbor_strs: list[str]) -> str:
+        return f"""You are a topic modeling expert analyzing research topic evolution.
+
+GLOBAL TOPIC (from previous memory):
+  {global_topic.to_string()}
+
+NEARBY LOCAL TOPICS (from current data):
+{chr(10).join(neighbor_strs)}
+
+TASK: Estimate the probability that the global topic is still semantically alive
+in the current data. Return a soft probability, not a hard decision.
+
+Use 0.0 for obsolete/unsupported, 1.0 for clearly active, and intermediate
+values for partial survival or drift.
+
+Respond ONLY with a JSON object:
+{{"retain_probability": 0.0-1.0, "reason": "brief explanation"}}
+"""
+
+    def _build_novelty_prior_prompt(self, local_topic: Topic,
+                                    neighbor_strs: list[str]) -> str:
+        return f"""You are a topic modeling expert analyzing research topic evolution.
+
+LOCAL TOPIC (from current data):
+  {local_topic.to_string()}
+
+NEARBY GLOBAL TOPICS (existing memory):
+{chr(10).join(neighbor_strs)}
+
+TASK: Estimate the probability that the local topic contains genuinely new
+semantic content not already represented by the global memory. Return a soft
+probability, not a hard decision.
+
+Use 0.0 for fully covered, 1.0 for clearly novel, and intermediate values for
+partial novelty or semantic drift.
+
+Respond ONLY with a JSON object:
+{{"novelty_probability": 0.0-1.0, "reason": "brief explanation"}}
+"""
+
+    def _parse_retain_prior_response(self, response: str, topic_id: int) -> RetainPrior:
+        try:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                prob = _clip_probability(data.get("retain_probability", 0.5))
+                return RetainPrior(
+                    topic_id=topic_id,
+                    probability=prob,
+                    reason=data.get("reason", ""),
+                )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
+        return RetainPrior(topic_id=topic_id, probability=0.5,
+                           reason="LLM parse failure")
+
+    def _parse_novelty_prior_response(self, response: str, topic_id: int) -> NoveltyPrior:
+        try:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                prob = _clip_probability(data.get("novelty_probability", 0.5))
+                return NoveltyPrior(
+                    topic_id=topic_id,
+                    probability=prob,
+                    reason=data.get("reason", ""),
+                )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            pass
+        return NoveltyPrior(topic_id=topic_id, probability=0.5,
+                            reason="LLM parse failure")
+
+    def _retain_prior_fallback(
+        self,
+        global_topics: list[Topic],
+        local_topics: list[Topic],
+    ) -> list[RetainPrior]:
+        """Similarity-based soft retain priors."""
+        if not local_topics:
+            return [
+                RetainPrior(topic_id=g.id, probability=0.0,
+                            reason="No local topics to support")
+                for g in global_topics
+            ]
+
+        threshold = self.fallback_config.get("prune_threshold", 0.3)
+        scale = self.fallback_config.get("soft_scale", 12.0)
+        sim_matrix = cosine_similarity_matrix(global_topics, local_topics)
+        priors = []
+        for g_idx, g_topic in enumerate(global_topics):
+            max_sim = float(sim_matrix[g_idx].max())
+            prob = _sigmoid(scale * (max_sim - threshold))
+            priors.append(RetainPrior(
+                topic_id=g_topic.id,
+                probability=prob,
+                reason=f"fallback max_sim={max_sim:.3f}",
+            ))
+        return priors
+
+    def _novelty_prior_fallback(
+        self,
+        local_topics: list[Topic],
+        global_topics: list[Topic],
+    ) -> list[NoveltyPrior]:
+        """Similarity-based soft novelty priors."""
+        if not global_topics:
+            return [
+                NoveltyPrior(topic_id=l.id, probability=1.0,
+                             reason="No global topics to compare")
+                for l in local_topics
+            ]
+
+        threshold = self.fallback_config.get("novel_threshold", 0.5)
+        scale = self.fallback_config.get("soft_scale", 12.0)
+        sim_matrix = cosine_similarity_matrix(local_topics, global_topics)
+        priors = []
+        for l_idx, l_topic in enumerate(local_topics):
+            max_sim = float(sim_matrix[l_idx].max())
+            prob = _sigmoid(scale * (threshold - max_sim))
+            priors.append(NoveltyPrior(
+                topic_id=l_topic.id,
+                probability=prob,
+                reason=f"fallback max_sim={max_sim:.3f}",
+            ))
+        return priors
 
     def stage1_prune_and_refine(
         self,
@@ -398,3 +602,12 @@ def _merge_topic_words(topic_a: Topic, topic_b: Topic, max_words: int = 15) -> l
             merged.append(w)
             seen.add(w)
     return merged[:max_words]
+
+
+def _clip_probability(value, eps: float = 1e-4) -> float:
+    """Convert an LLM/fallback value into a valid probability."""
+    return float(np.clip(float(value), eps, 1.0 - eps))
+
+
+def _sigmoid(x: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-x)))

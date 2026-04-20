@@ -29,13 +29,14 @@ from pathlib import Path
 from typing import Optional
 
 from src.data_loader import Corpus, TimestampData, make_dataloader
-from src.vae import ProdLDA, train_vae
+from src.vae import ProdLDA, train_vae, infer_theta_fixed_beta
 from src.topic_utils import (
-    extract_topics, embed_topics, topic_diversity,
+    extract_topics, embed_topics_from_beta, topic_diversity,
     topic_coherence_pmi, cosine_similarity_matrix,
 )
 from src.llm_curator import LLMCurator, CurationDecision
 from src.global_memory import GlobalMemory
+from src.soft_controller import build_gate_features, train_soft_controller
 
 
 class ContinualTopicPipeline:
@@ -57,6 +58,7 @@ class ContinualTopicPipeline:
         self.patience = vae_cfg["patience"]
         self.kl_warmup = vae_cfg["kl_warmup_epochs"]
         self.use_residual = vae_cfg.get("use_residual", True)
+        self.factorized_decoder = vae_cfg.get("factorized_decoder", True)
 
         # Topic config
         topic_cfg = config["topics"]
@@ -69,6 +71,21 @@ class ContinualTopicPipeline:
         self.output_dir = Path(pipe_cfg["output_dir"])
         self.save_intermediate = pipe_cfg.get("save_intermediate", True)
         self.seed = pipe_cfg.get("seed", 42)
+
+        # Soft memory config
+        soft_cfg = config.get("soft_memory", {})
+        self.use_soft_memory = soft_cfg.get("enabled", False)
+        self.tau_assign = soft_cfg.get("tau_assign", 0.1)
+        self.tau_replace = soft_cfg.get("tau_replace", 0.1)
+        self.novelty_lambda = soft_cfg.get("novelty_lambda", 0.3)
+        self.lambda_llm = soft_cfg.get("lambda_llm", 1.0)
+        self.controller_lr = soft_cfg.get("controller_lr", 1e-3)
+        self.controller_epochs = soft_cfg.get("controller_epochs", 20)
+        self.controller_hidden = soft_cfg.get("controller_hidden", 16)
+        self.infer_aligned_theta = soft_cfg.get("infer_aligned_theta", True)
+        self.theta_epochs = soft_cfg.get("theta_epochs", 50)
+        self.theta_kl_warmup = soft_cfg.get("theta_kl_warmup_epochs", 10)
+        self.soft_eps = soft_cfg.get("eps", 1e-8)
 
         # Device
         device_str = pipe_cfg.get("device", "auto")
@@ -87,6 +104,7 @@ class ContinualTopicPipeline:
         self.global_memory = GlobalMemory(
             embedding_model=self.embedding_model,
             max_topics=max_topics,
+            vocab=self.corpus.vocab,
         )
 
         # Results tracking
@@ -108,6 +126,8 @@ class ContinualTopicPipeline:
         print(f"Topics per timestamp: {self.n_topics}")
         print(f"Vocab size: {self.corpus.vocab_size}")
         print(f"Residual learning: {self.use_residual}")
+        print(f"Factorized decoder: {self.factorized_decoder}")
+        print(f"Soft memory: {self.use_soft_memory}")
         print(f"LLM provider: {self.curator.provider}")
         print(f"{'='*70}\n")
 
@@ -169,7 +189,14 @@ class ContinualTopicPipeline:
             result["n_removed"] = 0
             result["n_novel"] = len(local_topics)
             result["n_global"] = self.global_memory.n_topics
+            if self.use_soft_memory and self.infer_aligned_theta:
+                theta, theta_info = self._infer_aligned_theta(ts)
+                result["aligned_theta"] = theta
+                result["theta_info"] = theta_info
             return result
+
+        if self.use_soft_memory:
+            return self._process_timestamp_soft(ts, local_topics, local_beta, result)
 
         # ── Step 2: LLM Stage 1 — Prune & Refine ────────────────────────────
         active_global = self.global_memory.active_topics
@@ -241,6 +268,103 @@ class ContinualTopicPipeline:
 
         return result
 
+    def _process_timestamp_soft(
+        self,
+        ts: int,
+        local_topics: list,
+        local_beta: np.ndarray,
+        result: dict,
+    ) -> dict:
+        """Process one timestamp with the soft fixed-slot memory update."""
+        active_global = self.global_memory.active_topics
+
+        print(f"\n  Step 2: Estimating soft LLM priors...")
+        retain_priors = self.curator.score_retain_priors(
+            global_topics=active_global,
+            local_topics=local_topics,
+            top_k=self.top_k_nearest,
+        )
+        novelty_priors = self.curator.score_novelty_priors(
+            local_topics=local_topics,
+            global_topics=active_global,
+            top_k=self.top_k_nearest,
+        )
+
+        p = np.array([x.probability for x in retain_priors], dtype=np.float32)
+        q = np.array([x.probability for x in novelty_priors], dtype=np.float32)
+        sim_matrix = cosine_similarity_matrix(local_topics, active_global)
+
+        print(f"\n  Step 3: Training soft gate controller...")
+        retain_features, novelty_features = build_gate_features(sim_matrix, p, q)
+        retain_gates, novelty_gates, controller_info = train_soft_controller(
+            retain_features=retain_features,
+            novelty_features=novelty_features,
+            retain_priors=p,
+            novelty_priors=q,
+            epochs=self.controller_epochs,
+            lr=self.controller_lr,
+            lambda_llm=self.lambda_llm,
+            hidden=self.controller_hidden,
+            device=self.device,
+        )
+        print(
+            f"  Gates: mean survival={retain_gates.mean():.3f}, "
+            f"mean novelty={novelty_gates.mean():.3f}"
+        )
+
+        print(f"\n  Step 4: Soft-updating fixed global memory...")
+        update_stats = self.global_memory.soft_update(
+            local_topics=local_topics,
+            local_beta=local_beta,
+            retain_gates=retain_gates,
+            novelty_gates=novelty_gates,
+            vocab=self.corpus.vocab,
+            top_m=self.top_m,
+            timestamp=ts,
+            tau_assign=self.tau_assign,
+            tau_replace=self.tau_replace,
+            novelty_lambda=self.novelty_lambda,
+            eps=self.soft_eps,
+        )
+
+        result["n_retained"] = int(np.rint(retain_gates.sum()))
+        result["n_removed"] = 0
+        result["n_novel"] = int(np.rint(novelty_gates.sum()))
+        result["n_global"] = self.global_memory.n_topics
+        result["global_diversity"] = topic_diversity(self.global_memory.active_topics)
+        result["soft_update"] = update_stats
+        result["controller_info"] = controller_info
+        result["mean_retain_prior"] = float(p.mean()) if len(p) else 0.0
+        result["mean_novelty_prior"] = float(q.mean()) if len(q) else 0.0
+
+        if self.infer_aligned_theta:
+            print(f"\n  Step 5: Inferring aligned theta under updated memory...")
+            theta, theta_info = self._infer_aligned_theta(ts)
+            result["aligned_theta"] = theta
+            result["theta_info"] = theta_info
+
+        return result
+
+    def _infer_aligned_theta(self, ts: int):
+        """Infer document-topic proportions in the current global slot space."""
+        ts_data = self.corpus.train_data[ts]
+        loader = make_dataloader(ts_data, batch_size=self.batch_size, shuffle=False)
+        theta, info = infer_theta_fixed_beta(
+            train_loader=loader,
+            beta=self.global_memory.beta_logits,
+            vocab_size=self.corpus.vocab_size,
+            n_topics=self.global_memory.n_topics,
+            enc_hidden=self.enc_hidden,
+            dropout=self.dropout,
+            epochs=self.theta_epochs,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            kl_warmup_epochs=self.theta_kl_warmup,
+            device=self.device,
+        )
+        print(f"  Aligned theta: {theta.shape[0]} docs x {theta.shape[1]} topics")
+        return theta, info
+
     def _step1_train_vae(self, ts: int, n_topics_override: Optional[int] = None):
         """Train VAE on a single timestamp's data and extract local topics.
 
@@ -269,6 +393,9 @@ class ContinualTopicPipeline:
             n_topics=n_topics,
             enc_hidden=self.enc_hidden,
             dropout=self.dropout,
+            vocab=self.corpus.vocab,
+            embedding_model=self.embedding_model,
+            factorized_decoder=self.factorized_decoder,
         )
 
         # Global beta for residual learning — always (K_{t-1}, V) in dynamic design
@@ -306,7 +433,18 @@ class ContinualTopicPipeline:
         )
 
         # Compute embeddings
-        local_topics = embed_topics(local_topics, self.embedding_model)
+        local_alpha = model.get_topic_embeddings()
+        if local_alpha is not None:
+            for topic, emb in zip(local_topics, local_alpha):
+                topic.embedding = emb
+                topic.metadata["embedding_source"] = "factorized_decoder_alpha"
+        else:
+            local_topics = embed_topics_from_beta(
+                local_topics,
+                beta,
+                self.corpus.vocab,
+                self.embedding_model,
+            )
 
         return local_topics, beta, train_info
 
@@ -349,6 +487,9 @@ class ContinualTopicPipeline:
                         if not isinstance(v, np.ndarray)}
         with open(ts_dir / "result.json", "w") as f:
             json.dump(serializable, f, indent=2, default=str)
+
+        if "aligned_theta" in result:
+            np.save(str(ts_dir / "aligned_theta.npy"), result["aligned_theta"])
 
         # Save global memory snapshot
         self.global_memory.save(str(ts_dir / "global_memory"))

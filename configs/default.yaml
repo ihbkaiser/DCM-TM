@@ -26,6 +26,8 @@ vae:
   kl_warmup_epochs: 20  # linearly anneal KL weight from 0 → 1
   # Residual delta learning
   use_residual: true    # L_t = G_{t-1} + ΔL_t
+  # Factorized decoder: topic logits are alpha_k dot vocabulary embeddings
+  factorized_decoder: true
 
 topics:
   # Number of top words to represent each topic
@@ -57,6 +59,28 @@ llm:
     prune_threshold: 0.3
     # If max cosine sim between local topic and any global topic < this → NOVEL
     novel_threshold: 0.5
+    # Controls softness of fallback probabilities around thresholds
+    soft_scale: 12.0
+
+soft_memory:
+  # Enable the soft fixed-slot DCM-TM update. If false, the original hard
+  # retain/remove + novel/covered dynamic-K pipeline is used.
+  enabled: true
+  tau_assign: 0.1
+  tau_replace: 0.1
+  novelty_lambda: 0.3
+  lambda_llm: 1.0
+  eps: 1.0e-8
+
+  # Lightweight controller trained after local topics and LLM priors exist.
+  controller_lr: 0.001
+  controller_epochs: 20
+  controller_hidden: 16
+
+  # Needed when document-topic vectors must be aligned across timestamps.
+  infer_aligned_theta: true
+  theta_epochs: 50
+  theta_kl_warmup_epochs: 10
 
 pipeline:
   # Output directory for results

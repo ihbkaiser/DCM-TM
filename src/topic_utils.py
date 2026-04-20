@@ -69,6 +69,7 @@ def extract_topics(
 # ─── Topic Embedding ─────────────────────────────────────────────────────────
 
 _model_cache: dict[str, SentenceTransformer] = {}
+_word_embedding_cache: dict[tuple[str, int, int], np.ndarray] = {}
 
 
 def get_embedding_model(model_name: str = "all-MiniLM-L6-v2") -> SentenceTransformer:
@@ -99,6 +100,69 @@ def embed_topics(
         topic.embedding = emb / (np.linalg.norm(emb) + 1e-12)  # L2 normalize
 
     return topics
+
+
+def embed_topics_from_beta(
+    topics: list[Topic],
+    beta: np.ndarray,
+    vocab: list[str],
+    model_name: str = "all-MiniLM-L6-v2",
+    batch_size: int = 512,
+) -> list[Topic]:
+    """Compute topic embeddings as alpha_k = sum_v beta_kv * e_v.
+
+    Top words are still kept for readable prompts and summaries, but nearest
+    topic retrieval uses these full-distribution weighted embeddings.
+    """
+    if len(topics) == 0:
+        return topics
+
+    beta = np.asarray(beta, dtype=np.float32)
+    if beta.shape[0] != len(topics):
+        raise ValueError("beta rows must match number of topics")
+    if beta.shape[1] != len(vocab):
+        raise ValueError("beta columns must match vocabulary size")
+
+    word_embeddings = get_word_embedding_matrix(
+        vocab=vocab,
+        model_name=model_name,
+        batch_size=batch_size,
+    )
+
+    weights = beta / (beta.sum(axis=1, keepdims=True) + 1e-12)
+    topic_embeddings = weights @ word_embeddings
+    topic_embeddings = topic_embeddings / (
+        np.linalg.norm(topic_embeddings, axis=1, keepdims=True) + 1e-12
+    )
+
+    for topic, emb in zip(topics, topic_embeddings):
+        topic.embedding = emb
+        topic.metadata["embedding_source"] = "beta_weighted_vocab"
+
+    return topics
+
+
+def get_word_embedding_matrix(
+    vocab: list[str],
+    model_name: str = "all-MiniLM-L6-v2",
+    batch_size: int = 512,
+) -> np.ndarray:
+    """Return L2-normalized word embeddings for the full vocabulary."""
+    cache_key = (model_name, len(vocab), hash("\n".join(vocab)))
+    if cache_key not in _word_embedding_cache:
+        model = get_embedding_model(model_name)
+        print(f"  Embedding vocabulary with {model_name}: {len(vocab)} words")
+        embeddings = model.encode(
+            vocab,
+            show_progress_bar=False,
+            batch_size=batch_size,
+        )
+        embeddings = embeddings.astype(np.float32)
+        embeddings = embeddings / (
+            np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12
+        )
+        _word_embedding_cache[cache_key] = embeddings
+    return _word_embedding_cache[cache_key]
 
 
 # ─── Similarity ──────────────────────────────────────────────────────────────
